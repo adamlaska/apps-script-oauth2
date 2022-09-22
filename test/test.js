@@ -1,3 +1,19 @@
+/**
+ * Copyright 2022 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 var assert = require('chai').assert;
 var gas = require('gas-local');
 var MockUrlFetchApp = require('./mocks/urlfetchapp');
@@ -5,30 +21,11 @@ var MockProperties = require('./mocks/properties');
 var MockCache = require('./mocks/cache');
 var MockLock = require('./mocks/lock');
 var MockScriptApp = require('./mocks/script');
-var MockBlob = require('./mocks/blob');
-var Future = require('fibers/future');
-var URLSafeBase64 = require('urlsafe-base64');
-
+var MockUtilities = require('./mocks/utilities');
 var mocks = {
   ScriptApp: new MockScriptApp(),
   UrlFetchApp: new MockUrlFetchApp(),
-  Utilities: {
-    base64Encode: (data) => {
-      return Buffer.from(data).toString('base64');
-    },
-    base64EncodeWebSafe: (data) => {
-      return URLSafeBase64.encode(Buffer.from(data));
-    },
-    base64DecodeWebSafe: (data) => {
-      return URLSafeBase64.decode(data);
-    },
-    computeRsaSha256Signature: (data, key) => {
-      return Math.random().toString(36);
-    },
-    newBlob: (data) => {
-      return new MockBlob(data);
-    },
-  },
+  Utilities: new MockUtilities(),
   __proto__: gas.globalMockDefault
 };
 var OAuth2 = gas.require('./src', mocks);
@@ -300,6 +297,7 @@ describe('Service', () => {
         expires_in: 100,
         refresh_token: 'bar'
       };
+      var lock = new MockLock();
       var properties = new MockProperties({
         'oauth2.test': JSON.stringify(token)
       });
@@ -309,32 +307,15 @@ describe('Service', () => {
         access_token: Math.random().toString(36)
       });
 
-      var getAccessToken = (() => {
-        var service = OAuth2.createService('test')
-            .setClientId('abc')
-            .setClientSecret('def')
-            .setTokenUrl('http://www.example.com')
-            .setPropertyStore(properties)
-            .setLock(new MockLock());
-        if (service.hasAccess()) {
-          return service.getAccessToken();
-        } else {
-          throw new Error('No access: ' + service.getLastError());
-        };
-      }).future();
-
-      Future.task(() => {
-        var first = getAccessToken();
-        var second = getAccessToken();
-        Future.wait(first, second);
-        return [first.get(), second.get()];
-      }).resolve((err, accessTokens) => {
-        if (err) {
-          done(err);
-        }
-        assert.equal(accessTokens[0], accessTokens[1]);
-        done();
-      });
+      var service = OAuth2.createService('test')
+          .setClientId('abc')
+          .setClientSecret('def')
+          .setTokenUrl('http://www.example.com')
+          .setPropertyStore(properties)
+          .setLock(lock);
+      service.hasAccess();
+      assert.equal(lock.counter, 1);
+      done();
     });
 
     it('should not acquire a lock when the token is not expired', () => {
@@ -380,61 +361,62 @@ describe('Service', () => {
   });
 
   describe('#refresh()', () => {
-    /*
-      A race condition can occur when two executions attempt to refresh the
-      token at the same time. Some OAuth implementations only allow one
-      valid access token at a time, so we need to ensure that the last access
-      token granted is the one that is persisted. To replicate this, we have the
-      first exeuction wait longer for it's response to return through the
-      "network" and have the second execution get it's response back sooner.
-    */
     it('should use the lock to prevent race conditions', (done) => {
       var token = {
         granted_time: 100,
-        expires_in: 100,
+        expires_in: 0,
         refresh_token: 'bar'
+      };
+      var lock = new MockLock();
+      var properties = new MockProperties({
+        'oauth2.test': JSON.stringify(token)
+      });
+
+      mocks.UrlFetchApp.resultFunction = () => JSON.stringify({
+        access_token: Math.random().toString(36)
+      });
+      OAuth2.createService('test')
+          .setClientId('abc')
+          .setClientSecret('def')
+          .setTokenUrl('http://www.example.com')
+          .setPropertyStore(properties)
+          .setLock(lock)
+          .refresh();
+      assert.equal(lock.counter, 1);
+      done();
+    });
+
+    it('should retain refresh expiry', () => {
+      const NOW_SECONDS = OAuth2.getTimeInSeconds_(new Date());
+      const ONE_HOUR_AGO_SECONDS = NOW_SECONDS - 360;
+      var token = {
+        granted_time: ONE_HOUR_AGO_SECONDS,
+        expires_in: 100,
+        refresh_token: 'bar',
+        refresh_token_expires_in: 720
       };
       var properties = new MockProperties({
         'oauth2.test': JSON.stringify(token)
       });
 
-      var count = 0;
       mocks.UrlFetchApp.resultFunction = () => {
         return JSON.stringify({
-          access_token: 'token' + count++
+          access_token: 'token'
         });
       };
-      var delayGenerator = function*() {
-        yield 100;
-        yield 10;
-      }();
-      mocks.UrlFetchApp.delayFunction = () => {
-        return delayGenerator.next().value;
-      };
 
-      var refreshToken = (() => {
-        OAuth2.createService('test')
-            .setClientId('abc')
-            .setClientSecret('def')
-            .setTokenUrl('http://www.example.com')
-            .setPropertyStore(properties)
-            .setLock(new MockLock())
-            .refresh();
-      }).future();
+      OAuth2.createService('test')
+          .setClientId('abc')
+          .setClientSecret('def')
+          .setTokenUrl('http://www.example.com')
+          .setPropertyStore(properties)
+          .setLock(new MockLock())
+          .refresh();
 
-      Future.task(() => {
-        var first = refreshToken();
-        var second = refreshToken();
-        Future.wait(first, second);
-        return [first.get(), second.get()];
-      }).resolve((err) => {
-        if (err) {
-          done(err);
-        }
-        var storedToken = JSON.parse(properties.getProperty('oauth2.test'));
-        assert.equal(storedToken.access_token, 'token1');
-        done();
-      });
+      var storedToken = JSON.parse(properties.getProperty('oauth2.test'));
+      assert.equal(storedToken.access_token, 'token');
+      assert.equal(storedToken.refresh_token, 'bar');
+      assert.equal(storedToken.refreshTokenExpiresAt, NOW_SECONDS + 360);
     });
   });
 
@@ -509,6 +491,31 @@ describe('Service', () => {
     });
   });
 
+  describe('#generateCodeVerifier()', () => {
+    it('should not include code challenge unless requested', () => {
+      var service = OAuth2.createService('test')
+          .setAuthorizationBaseUrl('http://www.example.com')
+          .setClientId('abc')
+          .setClientSecret('def')
+          .setCallbackFunction('authCallback');
+      var authorizationUrl = service.getAuthorizationUrl({});
+      assert.notInclude(authorizationUrl, 'code_challenge');
+      assert.notInclude(authorizationUrl, 'code_challenge_method');
+    });
+
+    it('should use generated challenge string', () => {
+      var service = OAuth2.createService('test')
+          .setAuthorizationBaseUrl('http://www.example.com')
+          .setClientId('abc')
+          .setClientSecret('def')
+          .setCallbackFunction('authCallback')
+          .generateCodeVerifier();
+      var authorizationUrl = service.getAuthorizationUrl({});
+      assert.include(authorizationUrl, 'code_challenge');
+      assert.include(authorizationUrl, 'code_challenge_method=S256');
+    });
+  });
+
   describe('#getAuthorizationUrl()', () => {
     it('should add additional parameters to the state token', () => {
       var service = OAuth2.createService('test')
@@ -532,6 +539,75 @@ describe('Service', () => {
       var state = JSON.parse(params.state);
 
       assert.equal(state.arguments.foo, 'bar');
+    });
+  });
+
+  describe('#ensureExpiresAtSet_()', () => {
+    const NOW_SECONDS = OAuth2.getTimeInSeconds_(new Date());
+    var service = OAuth2.createService('test')
+        .setPropertyStore(new MockProperties())
+        .setCache(new MockCache());
+
+    it('should set expires at', () => {
+      const token = {
+        granted_time: NOW_SECONDS,
+        expires_in_sec: 100
+      };
+      service.ensureExpiresAtSet_(token);
+      assert.include(token, {
+        expiresAt: NOW_SECONDS + 100
+      });
+    });
+
+    it('should set refresh expires at', () => {
+      const token = {
+        granted_time: NOW_SECONDS,
+        refresh_token_expires_in: 200
+      };
+      service.ensureExpiresAtSet_(token);
+      assert.include(token, {
+        refreshTokenExpiresAt: NOW_SECONDS + 200
+      });
+    });
+  });
+
+  describe('#canRefresh_()', () => {
+    const NOW_SECONDS = OAuth2.getTimeInSeconds_(new Date());
+    const ONE_HOUR_AGO_SECONDS = NOW_SECONDS - 360;
+    const ONE_HOUR_LATER_SECONDS = NOW_SECONDS + 360;
+    var service = OAuth2.createService('test')
+        .setPropertyStore(new MockProperties())
+        .setCache(new MockCache());
+
+    it('should return false if no refresh token', () => {
+      const token = {};
+      assert.isFalse(service.canRefresh_(token));
+    });
+
+    it('should return true if there is a refresh token', () => {
+      const token = {
+        refresh_token: 'bar',
+      };
+      assert.isTrue(service.canRefresh_(token));
+    });
+
+    it('should return true if it is not expired', () => {
+      const token = {
+        refresh_token: 'bar',
+        expiresAt: ONE_HOUR_LATER_SECONDS,
+        refreshTokenExpiresAt: ONE_HOUR_LATER_SECONDS
+      };
+      console.log('test');
+      assert.isTrue(service.canRefresh_(token));
+    });
+
+    it('should return false if it is expired', () => {
+      const token = {
+        refresh_token: 'bar',
+        expiresAt: ONE_HOUR_LATER_SECONDS,
+        refreshTokenExpiresAt: ONE_HOUR_AGO_SECONDS
+      };
+      assert.isFalse(service.canRefresh_(token));
     });
   });
 
